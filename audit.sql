@@ -8,6 +8,13 @@
 -- but has been modified to use JSONB insead of HSTORE
 --
 
+
+CREATE SCHEMA audit;
+REVOKE ALL ON SCHEMA audit FROM public;
+COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigger functions';
+
+
+
 --
 -- Implments "JSONB - keys[]", returns a JSONB document with the keys removed
 --
@@ -16,17 +23,14 @@
 -- param 0: JSONB, source JSONB document to remove keys from
 -- param 1: text[], keys to remove from the JSONB document
 --
-CREATE OR REPLACE FUNCTION "jsonb_minus"(
-  "json" jsonb,
-  "keys" TEXT[]
-)
+CREATE OR REPLACE FUNCTION audit.jsonb_minus("json" jsonb, "keys" TEXT[])
   RETURNS jsonb
   LANGUAGE sql
   IMMUTABLE
   STRICT
 AS $function$
   SELECT
-    -- Only executes opration if the JSON document has the keys
+    -- Only executes operation if the JSON document has the keys
     CASE WHEN "json" ?| "keys"
       THEN COALESCE(
           (SELECT ('{' || string_agg(to_json("key")::text || ':' || "value", ',') || '}')
@@ -39,13 +43,6 @@ AS $function$
 $function$;
 
 
-CREATE OPERATOR - (
-  LEFTARG = jsonb,
-  RIGHTARG = text[],
-  PROCEDURE = jsonb_minus
-);
-
-
 --
 -- Implments "JSONB - JSONB", returns a recursive diff of the JSON documents
 --
@@ -54,7 +51,7 @@ CREATE OPERATOR - (
 -- param 0: JSONB, primary JSONB source document to compare
 -- param 1: JSONB, secondary JSONB source document to compare
 --
-CREATE OR REPLACE FUNCTION jsonb_minus ( arg1 jsonb, arg2 jsonb )
+CREATE OR REPLACE FUNCTION audit.jsonb_minus(arg1 jsonb, arg2 jsonb)
 RETURNS jsonb
 AS $$
 
@@ -66,7 +63,7 @@ AS $$
           -- if the value is an object and the value of the second argument is
           -- not null, we do a recursion
           WHEN jsonb_typeof(value) = 'object' AND arg2 -> key IS NOT NULL
-          THEN jsonb_minus(value, arg2 -> key)
+          THEN audit.jsonb_minus(value, arg2 -> key)
           -- for all the other types, we just return the value
           ELSE value
         END
@@ -82,16 +79,8 @@ AS $$
 $$ LANGUAGE SQL;
 
 
-CREATE OPERATOR - (
-  LEFTARG = jsonb,
-  RIGHTARG = jsonb,
-  PROCEDURE = jsonb_minus
-);
 
 
-CREATE SCHEMA audit;
-REVOKE ALL ON SCHEMA audit FROM public;
-COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigger functions';
 
 --
 -- Audited data. Lots of information is available, it's just a matter of how
@@ -166,24 +155,24 @@ BEGIN
     END IF;
 
     audit_row = ROW(
-        nextval('audit.log_id_seq'),                  -- log ID
-        TG_TABLE_SCHEMA::text,                        -- schema_name
-        TG_TABLE_NAME::text,                          -- table_name
-        TG_RELID,                                     -- relation OID for much quicker searches
-        session_user::text,                           -- session_user
-        current_timestamp,                            -- action_tstamp_tx
-        statement_timestamp(),                        -- action_tstamp_stm
-        clock_timestamp(),                            -- action_tstamp_clk
-        txid_current(),                               -- transaction ID
-        current_setting('application.name'),          -- client application
-        current_setting('application.user'),          -- client user
-        inet_client_addr(),                           -- client_addr
-        inet_client_port(),                           -- client_port
-        current_query(),                              -- top-level query or queries (if multistatement) from client
-        substring(TG_OP,1,1),                         -- action
-        NULL,                                         -- original
-        NULL,                                         -- diff
-        'f'                                           -- statement_only
+        nextval('audit.log_id_seq'),                            -- log ID
+        TG_TABLE_SCHEMA::text,                                  -- schema_name
+        TG_TABLE_NAME::text,                                    -- table_name
+        TG_RELID,                                               -- relation OID for much quicker searches
+        session_user::text,                                     -- session_user
+        current_timestamp,                                      -- action_tstamp_tx
+        statement_timestamp(),                                  -- action_tstamp_stm
+        clock_timestamp(),                                      -- action_tstamp_clk
+        txid_current(),                                         -- transaction ID
+        NULLIF(current_setting('application.name', true), ''),  -- client application - normalized as NULL
+        NULLIF(current_setting('application.user', true), ''),  -- client user - normalized as NULL
+        inet_client_addr(),                                     -- client_addr
+        inet_client_port(),                                     -- client_port
+        current_query(),                                        -- top-level query or queries (if multistatement) from client
+        substring(TG_OP,1,1),                                   -- action
+        NULL,                                                   -- original
+        NULL,                                                   -- diff
+        'f'                                                     -- statement_only
         );
 
     IF NOT TG_ARGV[0]::boolean IS DISTINCT FROM 'f'::boolean THEN
@@ -195,16 +184,16 @@ BEGIN
     END IF;
 
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.original = to_jsonb(OLD.*) - excluded_cols;
-        audit_row.diff = (to_jsonb(NEW.*) - audit_row.original) - excluded_cols;
+        audit_row.original = audit.jsonb_minus(to_jsonb(OLD.*), excluded_cols);
+        audit_row.diff = audit.jsonb_minus(audit.jsonb_minus(to_jsonb(NEW.*), audit_row.original), excluded_cols);
         IF audit_row.diff = '{}'::jsonb THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
         END IF;
     ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.original = to_jsonb(OLD.*) - excluded_cols;
+        audit_row.original = audit.jsonb_minus(to_jsonb(OLD.*), excluded_cols);
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
-        audit_row.original = to_jsonb(NEW.*) - excluded_cols;
+        audit_row.original = audit.jsonb_minus(to_jsonb(NEW.*), excluded_cols);
     ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
         audit_row.statement_only = 't';
     ELSE
@@ -297,7 +286,7 @@ Add auditing support to a table.
 Arguments:
    target_table:     Table name, schema qualified if not on search_path
    audit_rows:       Record each row change, or only audit at a statement level
-   audit_query_text: Record the text of the client query that triggered the audit event?
+   audit_query_text: Record the text of the client query that triggered the audit event
    ignored_cols:     Columns to exclude from update diffs, ignore updates that change only ignored cols.
 $body$;
 
